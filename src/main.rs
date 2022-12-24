@@ -1,5 +1,5 @@
 use std::{
-    collections::{LinkedList, VecDeque},
+    collections::LinkedList,
     fmt::{Debug, Display},
     rc::Rc,
     sync::{Arc, RwLock},
@@ -53,10 +53,6 @@ impl Env {
         self.frames.pop_back();
     }
 
-    fn new_empty_call_frame(&mut self) {
-        self.frames.push_back(Default::default());
-    }
-
     fn push_local(&mut self, name: Symbol, value: Rc<Value>, is_macro: bool) {
         match self.frames.front_mut() {
             Some(frame) => {
@@ -87,6 +83,8 @@ struct Closure {
     fun: Fun,
 }
 
+type Prim = fn(&mut Env, &[Rc<Value>]) -> Result<Rc<Value>, String>;
+
 enum Value {
     List(Vec<Rc<Value>>),
 
@@ -96,7 +94,7 @@ enum Value {
     Num(u64),
 
     Closure(Closure),
-    Prim(fn(&mut Env, &[Rc<Value>]) -> Result<Rc<Value>, String>),
+    Prim(Prim),
 }
 
 fn eval_fun(env: &mut Env, fun: &Fun, args: &[Rc<Value>]) -> Result<Rc<Value>, String> {
@@ -143,11 +141,9 @@ fn eval(env: &mut Env, body: Rc<Value>) -> Result<Rc<Value>, String> {
                 _ => Err(format!("cannot apply as function '{}'", body)),
             }
         }
-        Value::Symbol(n) => {
-            Ok(Rc::new(Value::Atom(n.clone())))
-        }
+        Value::Symbol(n) => Ok(Rc::new(Value::Atom(n.clone()))),
         Value::Atom(s) => match env.find_var(s) {
-            Some(rs) => Ok(rs.value.clone()),
+            Some(rs) => Ok(rs.value),
             None => Err(format!("cannot find variable '{}'", s.0)),
         },
         Value::Num(n) => Ok(Rc::new(Value::Num(*n))),
@@ -158,19 +154,19 @@ fn eval(env: &mut Env, body: Rc<Value>) -> Result<Rc<Value>, String> {
 fn macro_expand(expanded: &mut bool, env: &mut Env, body: Rc<Value>) -> Result<Rc<Value>, String> {
     match &*body {
         Value::List(ls) => {
-            if !ls.is_empty() {
-                match &*macro_expand(expanded, env, ls[0].clone())? {
+            if let [head, tail @ ..] = ls.as_slice() {
+                match &*macro_expand(expanded, env, head.clone())? {
                     Value::Closure(closure) => {
                         let mut new_env = closure.env.clone();
                         new_env.new_scope();
-                        let ret = eval_fun(&mut new_env, &closure.fun, &ls[1..])?;
+                        let ret = eval_fun(&mut new_env, &closure.fun, &tail)?;
                         new_env.pop_scope();
                         *expanded = true;
                         Ok(ret)
                     }
                     Value::Prim(prim) => {
                         *expanded = true;
-                        prim(env, &ls[1..])
+                        prim(env, &tail)
                     }
                     _ => {
                         let args = ls
@@ -185,9 +181,7 @@ fn macro_expand(expanded: &mut bool, env: &mut Env, body: Rc<Value>) -> Result<R
             }
         }
         Value::Atom(s) => match env.find_var(s) {
-            Some(def) if def.is_macro => {
-                macro_expand(expanded, env, def.value.clone())
-            }
+            Some(def) if def.is_macro => macro_expand(expanded, env, def.value),
             _ => Ok(body.clone()),
         },
         _ => Ok(body.clone()),
@@ -206,7 +200,7 @@ impl Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Value::List(ls) => {
-                if ls.len() > 0 {
+                if !ls.is_empty() {
                     write!(f, "(")?;
                     write!(f, "{}", ls[0])?;
                     for arg in &ls[1..] {
@@ -246,7 +240,7 @@ fn parse(code: &str) -> Result<Vec<Rc<Value>>, String> {
             }
             '0'..='9' => {
                 let mut num = char.to_digit(10).unwrap() as u64;
-                while chars.peek().is_some() && chars.peek().unwrap().is_digit(10) {
+                while chars.peek().is_some() && chars.peek().unwrap().is_ascii_digit() {
                     num *= 10;
                     num += chars.peek().unwrap().to_digit(10).unwrap() as u64;
                     chars.next();
@@ -284,20 +278,28 @@ fn parse(code: &str) -> Result<Vec<Rc<Value>>, String> {
     }
 
     if !mark.is_empty() {
-        println!("unclosed parenthesis")
+        Err("unclosed parenthesis".to_string())
+    } else {
+        Ok(stack)
     }
+}
 
-    Ok(stack)
+macro_rules! required_args {
+    ($args:expr, $num: expr) => {
+        if $args.len() != $num {
+            return Err(format!(
+                "Expected {} args but instead got {}!",
+                $num,
+                $args.len()
+            ));
+        }
+    };
 }
 
 fn empty_context() -> FxHashMap<String, Def> {
     fn lambda(env: &mut Env, args: &[Rc<Value>]) -> Result<Rc<Value>, String> {
-        if args.len() != 2 {
-            return Err(format!("Expected 2 args but instead got {}!", args.len()));
-        }
-
+        required_args!(args, 2);
         let mut params = vec![];
-
         if let Value::List(names) = &*args[0] {
             for name in names {
                 if let Value::Atom(atom) = &**name {
@@ -307,24 +309,20 @@ fn empty_context() -> FxHashMap<String, Def> {
                 }
             }
 
-            let fun = Fun {
-                params,
-                body: args[1].clone(),
-            };
+            let body = args[1].clone();
+            let fun = Fun { params, body };
 
-            return Ok(Rc::new(Value::Closure(Closure {
+            Ok(Rc::new(Value::Closure(Closure {
                 env: env.clone(),
                 fun,
-            })));
+            })))
         } else {
-            return Err("expected an identifier".to_string());
+            Err("expected an identifier".to_string())
         }
     }
 
     fn set_ctx(env: &mut Env, args: &[Rc<Value>], is_macro: bool) -> Result<Rc<Value>, String> {
-        if args.len() != 2 {
-            return Err(format!("Expected 2 args but instead got {} ", args.len()));
-        }
+        required_args!(args, 2);
 
         let value = eval(env, args[1].clone())?;
 
@@ -342,12 +340,8 @@ fn empty_context() -> FxHashMap<String, Def> {
     }
 
     fn let_decl(env: &mut Env, args: &[Rc<Value>]) -> Result<Rc<Value>, String> {
-        if args.len() != 3 {
-            return Err(format!("Expected 3 args but instead got {} ", args.len()));
-        }
-
+        required_args!(args, 3);
         let value = eval(env, args[1].clone())?;
-
         match &*args[0] {
             Value::Atom(name) => {
                 env.push_local(name.clone(), value, false);
@@ -358,30 +352,9 @@ fn empty_context() -> FxHashMap<String, Def> {
     }
 
     fn print(env: &mut Env, args: &[Rc<Value>]) -> Result<Rc<Value>, String> {
-        if args.len() != 1 {
-            return Err(format!("Expected 1 arg but instead got {} ", args.len()));
-        }
-
+        required_args!(args, 1);
         println!("{}", eval(env, args[0].clone())?);
-
         Ok(Rc::new(Value::List(vec![])))
-    }
-
-    fn add(env: &mut Env, args: &[Rc<Value>]) -> Result<Rc<Value>, String> {
-        let args = eval_list(env, args)?;
-
-        let mut result = 0;
-
-        for arg in args {
-            match &*arg {
-                Value::Num(n) => {
-                    result += n;
-                }
-                _ => return Err(format!("expected a number '{}'", arg)),
-            }
-        }
-
-        Ok(Rc::new(Value::Num(result)))
     }
 
     fn list(env: &mut Env, args: &[Rc<Value>]) -> Result<Rc<Value>, String> {
@@ -390,24 +363,18 @@ fn empty_context() -> FxHashMap<String, Def> {
     }
 
     fn evaluate(env: &mut Env, args: &[Rc<Value>]) -> Result<Rc<Value>, String> {
-        if args.len() != 1 {
-            return Err(format!("Expected 1 arg but instead got {} ", args.len()));
-        }
-
+        required_args!(args, 1);
         let res = eval(env, args[0].clone())?;
         eval(env, res)
     }
 
     fn quote(_: &mut Env, args: &[Rc<Value>]) -> Result<Rc<Value>, String> {
-        if args.len() != 1 {
-            return Err(format!("Expected 1 arg but instead got {} ", args.len()));
-        }
-
+        required_args!(args, 1);
         fn quoted(arg: Rc<Value>) -> Rc<Value> {
             match &*arg {
                 Value::List(ls) => Rc::new(Value::List(ls.iter().cloned().map(quoted).collect())),
                 Value::Atom(n) => Rc::new(Value::Symbol(n.clone())),
-                _ => arg.clone()
+                _ => arg.clone(),
             }
         }
 
@@ -422,10 +389,7 @@ fn empty_context() -> FxHashMap<String, Def> {
     }
 
     fn if_(env: &mut Env, args: &[Rc<Value>]) -> Result<Rc<Value>, String> {
-        if args.len() != 3 {
-            return Err(format!("Expected 3 arg but instead got {} ", args.len()));
-        }
-
+        required_args!(args, 3);
         let cond = eval(env, args[0].clone())?;
 
         if !is_nil_sttm(&cond) {
@@ -446,23 +410,19 @@ fn empty_context() -> FxHashMap<String, Def> {
     }
 
     fn eq(env: &mut Env, args: &[Rc<Value>]) -> Result<Rc<Value>, String> {
-        if args.len() != 2 {
-            return Err(format!("Expected 2 arg but instead got {} ", args.len()));
-        }
+        required_args!(args, 2);
 
         let args = eval_list(env, args)?;
 
         if cmp(&args[0], &args[1]) {
-            return Ok(Rc::new(Value::Atom(Symbol("true".to_string()))));
+            Ok(Rc::new(Value::Atom(Symbol("true".to_string()))))
         } else {
-            return Ok(Rc::new(Value::List(vec![])));
+            Ok(Rc::new(Value::List(vec![])))
         }
     }
 
     fn cons(env: &mut Env, args: &[Rc<Value>]) -> Result<Rc<Value>, String> {
-        if args.len() != 2 {
-            return Err(format!("Expected 2 arg but instead got {} ", args.len()));
-        }
+        required_args!(args, 2);
 
         let args = eval_list(env, args)?;
 
@@ -479,9 +439,7 @@ fn empty_context() -> FxHashMap<String, Def> {
     }
 
     fn is_nil(env: &mut Env, args: &[Rc<Value>]) -> Result<Rc<Value>, String> {
-        if args.len() != 1 {
-            return Err(format!("Expected 1 arg but instead got {} ", args.len()));
-        }
+        required_args!(args, 1);
 
         if let Value::List(ls) = &*eval(env, args[0].clone())? {
             if ls.is_empty() {
@@ -493,9 +451,7 @@ fn empty_context() -> FxHashMap<String, Def> {
     }
 
     fn is_cons(env: &mut Env, args: &[Rc<Value>]) -> Result<Rc<Value>, String> {
-        if args.len() != 1 {
-            return Err(format!("Expected 1 arg but instead got {} ", args.len()));
-        }
+        required_args!(args, 1);
 
         if let Value::List(ls) = &*eval(env, args[0].clone())? {
             if !ls.is_empty() {
@@ -507,9 +463,7 @@ fn empty_context() -> FxHashMap<String, Def> {
     }
 
     fn head(env: &mut Env, args: &[Rc<Value>]) -> Result<Rc<Value>, String> {
-        if args.len() != 1 {
-            return Err(format!("Expected 1 arg but instead got {} ", args.len()));
-        }
+        required_args!(args, 1);
 
         match &*eval(env, args[0].clone())? {
             Value::List(ls) if !ls.is_empty() => Ok(ls[0].clone()),
@@ -518,9 +472,7 @@ fn empty_context() -> FxHashMap<String, Def> {
     }
 
     fn tail(env: &mut Env, args: &[Rc<Value>]) -> Result<Rc<Value>, String> {
-        if args.len() != 1 {
-            return Err(format!("Expected 1 arg but instead got {} ", args.len()));
-        }
+        required_args!(args, 1);
 
         let res = eval(env, args[0].clone())?;
 
@@ -530,36 +482,43 @@ fn empty_context() -> FxHashMap<String, Def> {
         }
     }
 
+    fn num_op(env: &mut Env, args: &[Rc<Value>], op: fn(u64, u64) -> u64) -> Result<Rc<Value>, String> {
+        let args = eval_list(env, args)?;
+        let mut result = 0;
+        for arg in args {
+            if let Value::Num(n) = &*arg {
+                result = op(result, *n);
+            } else {
+                return Err(format!("expected a number '{}'", arg))
+            }
+        }
+        Ok(Rc::new(Value::Num(result)))
+    }
+
+    fn def(func: fn(&mut Env, &[Rc<Value>]) -> Result<Rc<Value>, String>) -> Def {
+        Def::new(Rc::new(Value::Prim(func)))
+    }
+
     let mut globals = FxHashMap::default();
 
-    globals.insert(
-        "set*".to_string(),
-        Def::new(Rc::new(Value::Prim(|env, ctx| set_ctx(env, ctx, false)))),
-    );
-    globals.insert(
-        "setm*".to_string(),
-        Def::new(Rc::new(Value::Prim(|env, ctx| set_ctx(env, ctx, true)))),
-    );
-    globals.insert("print".to_string(), Def::new(Rc::new(Value::Prim(print))));
-    globals.insert("+".to_string(), Def::new(Rc::new(Value::Prim(add))));
-    globals.insert("list".to_string(), Def::new(Rc::new(Value::Prim(list))));
-    globals.insert("eval".to_string(), Def::new(Rc::new(Value::Prim(evaluate))));
+    globals.insert("set*".to_string(), def(|e, c| set_ctx(e, c, false)));
+    globals.insert("setm*".to_string(), def(|e, c| set_ctx(e, c, true)));
+    globals.insert("print".to_string(), def(print));
+    globals.insert("list".to_string(), def(list));
+    globals.insert("eval".to_string(), def(evaluate));
     globals.insert("quote".to_string(), Def::imp(Rc::new(Value::Prim(quote))));
-    globals.insert("lambda".to_string(), Def::new(Rc::new(Value::Prim(lambda))));
+    globals.insert("lambda".to_string(), def(lambda));
+    globals.insert("if".to_string(), def(if_));
+    globals.insert("eq".to_string(), def(eq));
+    globals.insert("is-nil".to_string(), def(is_nil));
+    globals.insert("is-cons".to_string(), def(is_cons));
+    globals.insert("head".to_string(), def(head));
+    globals.insert("tail".to_string(), def(tail));
+    globals.insert("cons".to_string(), def(cons));
+    globals.insert("let".to_string(), def(let_decl));
 
-    globals.insert("if".to_string(), Def::new(Rc::new(Value::Prim(if_))));
-    globals.insert("eq".to_string(), Def::new(Rc::new(Value::Prim(eq))));
-
-    globals.insert("is-nil".to_string(), Def::new(Rc::new(Value::Prim(is_nil))));
-    globals.insert(
-        "is-cons".to_string(),
-        Def::new(Rc::new(Value::Prim(is_cons))),
-    );
-    globals.insert("head".to_string(), Def::new(Rc::new(Value::Prim(head))));
-    globals.insert("tail".to_string(), Def::new(Rc::new(Value::Prim(tail))));
-    globals.insert("cons".to_string(), Def::new(Rc::new(Value::Prim(cons))));
-
-    globals.insert("let".to_string(), Def::new(Rc::new(Value::Prim(let_decl))));
+    globals.insert("+".to_string(), def(|e, c| num_op(e, c, |a,b| a + b)));
+    globals.insert("-".to_string(), def(|e, c| num_op(e, c, |a,b| a - b)));
 
     globals
 }
