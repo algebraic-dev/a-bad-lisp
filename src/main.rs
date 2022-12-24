@@ -484,9 +484,16 @@ fn empty_context() -> FxHashMap<String, Def> {
 
     fn num_op(env: &mut Env, args: &[Rc<Value>], op: fn(u64, u64) -> u64) -> Result<Rc<Value>, String> {
         let args = eval_list(env, args)?;
-        let mut result = 0;
-        for arg in args {
-            if let Value::Num(n) = &*arg {
+        let mut result;
+
+        if let Value::Num(n) = &*args[0] {
+            result = *n;
+        } else {
+            return Err(format!("expected a number '{}'", args[0]))
+        }
+
+        for arg in &args[1..] {
+            if let Value::Num(n) = &**arg {
                 result = op(result, *n);
             } else {
                 return Err(format!("expected a number '{}'", arg))
@@ -497,6 +504,16 @@ fn empty_context() -> FxHashMap<String, Def> {
 
     fn def(func: fn(&mut Env, &[Rc<Value>]) -> Result<Rc<Value>, String>) -> Def {
         Def::new(Rc::new(Value::Prim(func)))
+    }
+
+    fn is_less(env: &mut Env, args: &[Rc<Value>]) -> Result<Rc<Value>, String> {
+        required_args!(args, 2);
+        let args = eval_list(env, args)?;
+        match (&*args[0], &*args[1]) {
+            (Value::Num(n), Value::Num(m)) if n < m => Ok(Rc::new(Value::Atom(Symbol("true".to_string())))),
+            _ => Ok(Rc::new(Value::List(vec![])))
+        }
+
     }
 
     let mut globals = FxHashMap::default();
@@ -519,6 +536,7 @@ fn empty_context() -> FxHashMap<String, Def> {
 
     globals.insert("+".to_string(), def(|e, c| num_op(e, c, |a,b| a + b)));
     globals.insert("-".to_string(), def(|e, c| num_op(e, c, |a,b| a - b)));
+    globals.insert("<".to_string(), def(is_less));
 
     globals
 }
@@ -546,9 +564,10 @@ fn main() -> Result<(), String> {
             (quasi-quote
                 (set* (unquote name) (lambda (unquote args) (unquote body)))))
 
-        (defn pudim (a b c) (+ a b c))
+        (defn fib (num)
+            (if (< num 2) num (+ (fib (- num 1)) (fib (- num 2)))))
 
-        (print (pudim 1 2 3))
+        (print (fib 40))
         ",
     )?;
 
