@@ -3,7 +3,26 @@
 version = 3
 
 [[package]]
-name = "aion"
+name = "bad-cli"
+version = "0.1.0"
+dependencies = [
+ "bad-interpreter",
+ "bad-types",
+ "fxhash",
+ "im",
+]
+
+[[package]]
+name = "bad-interpreter"
+version = "0.1.0"
+dependencies = [
+ "bad-types",
+ "fxhash",
+ "im",
+]
+
+[[package]]
+name = "bad-types"
 version = "0.1.0"
 dependencies = [
  "fxhash",

@@ -1,1 +1,2 @@
-# a-bad-lisp
+[# a-bad-lisp
+]
